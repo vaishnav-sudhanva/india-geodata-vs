@@ -22,6 +22,8 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 try:
     import yaml
@@ -37,6 +39,11 @@ GITHUB_REPO = "india-geodata"
 GITHUB_BASE = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
 RAW_BASE = f"{GITHUB_BASE}/raw/main"
 RELEASE_BASE = f"{GITHUB_BASE}/releases/download"
+
+INDIAN_COMMS_DATASET_REL = "data/infrastructure/indian_communications"
+INDIAN_COMMS_METADATA_URL = (
+    "https://raw.githubusercontent.com/yashveeeeeeer/indian_communications/main/metadata.json"
+)
 
 SKIP_FILES = {"metadata.json", "README.md", ".gitkeep", "Thumbs.db", ".DS_Store"}
 
@@ -202,12 +209,10 @@ def build_file_list(metadata, dataset_dir, dataset_rel_path):
             result.append(entry)
         return result
 
-    # No files in metadata — scan the directory first
     local_files = scan_directory_files(dataset_dir, dataset_rel_path)
     if local_files:
         return local_files
 
-    # No local data files either — try fetching from GitHub Releases
     if release_tag:
         assets = fetch_release_assets(release_tag)
         if assets:
@@ -241,21 +246,10 @@ def extract_level(metadata, dataset_rel_path):
     return None
 
 
-def process_metadata_file(filepath, repo_root):
-    """Process a single metadata.json file into a catalog entry."""
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"WARNING: Skipping {filepath}: {e}", file=sys.stderr)
-        return None
-
+def build_catalog_entry(metadata, repo_root, dataset_dir, dataset_rel_path):
+    """Turn parsed metadata into one catalog entry dict."""
     if not isinstance(metadata, dict):
-        print(f"WARNING: Skipping {filepath}: root is not a JSON object", file=sys.stderr)
         return None
-
-    dataset_dir = os.path.dirname(filepath)
-    dataset_rel_path = os.path.relpath(dataset_dir, start=repo_root).replace("\\", "/")
 
     license_info = metadata.get("license", {})
     if isinstance(license_info, str):
@@ -289,6 +283,43 @@ def process_metadata_file(filepath, repo_root):
         entry["release_url"] = f"{GITHUB_BASE}/releases/tag/{release_tag}"
 
     return entry
+
+
+def process_metadata_file(filepath, repo_root):
+    """Process a single metadata.json file into a catalog entry."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"WARNING: Skipping {filepath}: {e}", file=sys.stderr)
+        return None
+
+    dataset_dir = os.path.dirname(filepath)
+    dataset_rel_path = os.path.relpath(dataset_dir, start=repo_root).replace("\\", "/")
+    return build_catalog_entry(metadata, repo_root, dataset_dir, dataset_rel_path)
+
+
+def append_indian_communications_submodule_fallback(catalog, repo_root):
+    """If the git submodule is not checked out (e.g. CI default checkout), pull metadata."""
+    meta_path = os.path.join(repo_root, *INDIAN_COMMS_DATASET_REL.split("/"), "metadata.json")
+    if os.path.isfile(meta_path):
+        return
+    if any(e.get("url") == INDIAN_COMMS_DATASET_REL for e in catalog):
+        return
+    try:
+        with urllib.request.urlopen(INDIAN_COMMS_METADATA_URL, timeout=45) as resp:
+            metadata = json.load(resp)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        print(
+            f"WARNING: indian_communications metadata fallback failed ({INDIAN_COMMS_METADATA_URL}): {e}",
+            file=sys.stderr,
+        )
+        return
+    dataset_dir = os.path.join(repo_root, *INDIAN_COMMS_DATASET_REL.split("/"))
+    entry = build_catalog_entry(metadata, repo_root, dataset_dir, INDIAN_COMMS_DATASET_REL)
+    if entry is not None:
+        catalog.append(entry)
+        print("  (fallback) Added indian_communications entry from submodule mirror URL")
 
 
 def find_metadata_files(data_dir):
@@ -336,6 +367,8 @@ def main():
             total_files += len(entry.get("files", []))
         else:
             skipped += 1
+
+    append_indian_communications_submodule_fallback(catalog, repo_root)
 
     catalog.sort(key=lambda e: (e.get("category", ""), e.get("name", "")))
 
